@@ -611,8 +611,6 @@ var<workgroup> qkv_values: array<array<present_value_value_t, tile_size_k_vec>, 
     for (var k: u32 = 0u; k < uniforms.head_size_vec; k += tile_size_k_vec) {
       if (local_idx < tile_size_k_vec && k + local_idx < uniforms.head_size_vec) {
         tile_q[local_idx] = q[q_offset + k + local_idx];
-      } else {
-        tile_q[local_idx] = q_value_t(0);
       }
       workgroupBarrier();
       let q_data = tile_q[local_col] * q_element_t(uniforms.alpha);
@@ -647,7 +645,7 @@ var<workgroup> qkv_values: array<array<present_value_value_t, tile_size_k_vec>, 
     for (var i = 0u; i < tile_size && (total_seq_offset + i) < total_sequence_length; i++) {
       l_max = max(l_max, f32(tile_qk[i]));
     }
-    if (local_idx == 0u) {
+//    if (local_idx == 0u) {
       var l_sum = f32(0);
       for (var i = 0u; i < tile_size && (total_seq_offset + i) < total_sequence_length; i++) {
         l_sum += exp(f32(tile_qk[i]) - l_max);
@@ -656,9 +654,10 @@ var<workgroup> qkv_values: array<array<present_value_value_t, tile_size_k_vec>, 
         let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + workgroup_idx % uniforms.num_total_seq_length_tile;
         metadata[meta_offset] = metadata_value_t(l_max, l_sum);
       }
-    }
+//    }
 
-    tile_qk[local_idx] = q_element_t(exp(f32(sum) - l_max));
+     // 所有线程都知道 l_max 和 l_sum
+    tile_qk[local_idx] = q_element_t(exp(f32(sum) - l_max)/l_sum);
     workgroupBarrier();
 
     for (var k: u32 = 0u; k < uniforms.head_size_vec; k += tile_size_k_vec) {
@@ -887,27 +886,26 @@ var<workgroup> tile_input: array<array<output_value_t, TILE_SIZE>, TILE_SIZE>;
 
     // Calculate the global max and sum in qkv.
     var g_max = f32(-3.402823e+38f);
-    for (var i = 0u; i < uniforms.num_total_seq_length_tile; i++)
-    {
-      let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + i;
-      g_max = max(g_max, f32(metadata[meta_offset].x));
-    }
     var g_sum = f32(0);
+
     for (var i = 0u; i < uniforms.num_total_seq_length_tile; i++)
     {
-      let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + i;
-      let m_value = metadata[meta_offset];
-      g_sum += exp(f32(m_value.x) - g_max) * f32(m_value.y);
+        let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + i;
+        let l_max = f32(metadata[meta_offset].x);
+        let g_max_new = max(g_max, l_max);
+        g_sum = g_sum * exp(g_max - g_max_new) + f32(metadata[meta_offset].y) * exp(l_max - g_max_new);
+        g_max = g_max_new;
     }
 
     if (head_size_offset + local_col < uniforms.head_size_vec) {
-      for (var r = 0u; r < uniforms.num_total_seq_length_tile; r += TILE_SIZE) {
-        if (r + local_row < uniforms.num_total_seq_length_tile) {
-          let in_value = input[in_offset + (r + local_row) * uniforms.head_size_vec + head_size_offset + local_col];
-          let l_max = f32(metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row].x);
-          value += output_element_t(exp(l_max - g_max)) * in_value / output_element_t(g_sum);
+        for (var r = 0u; r < uniforms.num_total_seq_length_tile; r += TILE_SIZE) {
+            if (r + local_row < uniforms.num_total_seq_length_tile) {
+                let in_value = input[in_offset + (r + local_row) * uniforms.head_size_vec + head_size_offset + local_col];
+                let l_max = f32(metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row].x);
+                let l_sum = f32(metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row].y);
+                value += output_element_t(l_sum) * output_element_t(exp(l_max - g_max)) * in_value / output_element_t(g_sum);
+            }
         }
-      }
     }
 
     tile_input[local_row][local_col] = value;
@@ -959,7 +957,9 @@ Status ComputeFlashAttentionDecodeVxReduce(onnxruntime::webgpu::ComputeContext& 
 
 Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
                            Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
-                           const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context) {
+                           const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context, int local_window_size) {
+  ORT_ENFORCE(local_window_size == -1, "Sliding window is not supported yet in FlashAttention.");
+
   ORT_RETURN_IF_ERROR(CopyKVCache(context, parameters, K, past_key, present_key, V, past_value, present_value));
   const int present_sequence_length = parameters.is_gqa_ ? parameters.seqlen_present_kv_cache_ : parameters.total_sequence_length_;
   if (parameters.sequence_length_ > 1) {
