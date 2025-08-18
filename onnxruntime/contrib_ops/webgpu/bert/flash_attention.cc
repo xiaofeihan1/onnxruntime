@@ -497,7 +497,7 @@ var<workgroup> tile_input: array<array<output_value_t, TILE_SIZE>, TILE_SIZE>;
                 let meta_value = metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row];
                 let l_max = meta_value.x;
                 let l_sum = meta_value.y;
-                value += output_value_t(l_sum * exp(l_max - g_max) * vec4<f32>(in_value) / g_sum);
+                value += output_value_t((l_sum / g_sum) * exp(l_max - g_max) * vec4<f32>(in_value));
             }
         }
     }
