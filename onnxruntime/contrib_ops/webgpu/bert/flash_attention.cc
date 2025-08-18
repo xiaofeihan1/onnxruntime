@@ -247,7 +247,7 @@ var<workgroup> qkv_values: array<array<present_value_value_t, tile_size_k_vec>, 
     }
     if (local_idx == 0u) {
       let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + workgroup_idx % uniforms.num_total_seq_length_tile;
-      metadata[meta_offset] = metadata_value_t(l_max, l_sum);
+      metadata[meta_offset] = metadata_value_t(l_max, log(l_sum) + l_max);
     }
 
     tile_qk[local_idx] = q_element_t(exp(f32(sum) - l_max) / l_sum);
@@ -478,26 +478,35 @@ var<workgroup> tile_input: array<array<output_value_t, TILE_SIZE>, TILE_SIZE>;
     let local_col = local_idx % TILE_SIZE;
 
     // Calculate the global max and sum in qkv.
-    var g_max = f32(-3.402823e+38f);
-    var g_sum = f32(0);
+    // var g_max = f32(-3.402823e+38f);
+    // var g_sum = f32(0);
+
+    var LSE_max = f32(-3.402823e+38f);
+
     for (var i = 0u; i < uniforms.num_total_seq_length_tile; i++)
     {
         let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + i;
-        let meta_value = metadata[meta_offset];
-        let l_max = meta_value.x;
-        let g_max_new = max(g_max, l_max);
-        g_sum = g_sum * exp(g_max - g_max_new) + meta_value.y * exp(l_max - g_max_new);
-        g_max = g_max_new;
+        var LSE = f32(metadata[meta_offset].y);
+        LSE_max = max(LSE_max, LSE);
     }
+    var LSE_final = f32(0);
+    for (var i = 0u; i < uniforms.num_total_seq_length_tile; i++)
+    {
+        let meta_offset = head_idx * uniforms.num_present_sequence_length_tile + i;
+        var LSE = f32(metadata[meta_offset].y);
+        LSE_final += exp(LSE- LSE_max);
+    }
+    LSE_final = log(LSE_final) + LSE_max;
+
 
     if (head_size_offset + local_col < uniforms.head_size_vec) {
         for (var r = 0u; r < uniforms.num_total_seq_length_tile; r += TILE_SIZE) {
             if (r + local_row < uniforms.num_total_seq_length_tile) {
                 let in_value = input[in_offset + (r + local_row) * uniforms.head_size_vec + head_size_offset + local_col];
-                let meta_value = metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row];
-                let l_max = meta_value.x;
-                let l_sum = meta_value.y;
-                value += output_value_t((l_sum / g_sum) * exp(l_max - g_max) * vec4<f32>(in_value));
+                let LSE = f32(metadata[head_idx * uniforms.num_present_sequence_length_tile + r + local_row].y);
+                // value += output_element_t(exp(l_max - g_max - log(g_sum))) * in_value;
+                value += output_value_t(exp(LSE - LSE_final) * vec4<f32>(in_value));
+
             }
         }
     }
