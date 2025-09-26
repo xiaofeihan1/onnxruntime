@@ -131,6 +131,7 @@ class WebGpuContext final {
   void ReleaseGraphResources(std::vector<webgpu::CapturedCommandInfo>& captured_commands);
 
   void Flush(const webgpu::BufferManager& buffer_mgr);
+  void Flush();
 
   /**
    * Get the buffer manager.
@@ -250,7 +251,7 @@ class WebGpuContext final {
   std::unique_ptr<ProgramManager> program_mgr_;
 
   uint32_t num_pending_dispatches_ = 0;
-  const uint32_t max_num_pending_dispatches_ = 16;
+  const uint32_t max_num_pending_dispatches_ = 1;
 
   // profiling
   TimestampQueryType query_type_;

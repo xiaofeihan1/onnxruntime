@@ -735,6 +735,20 @@ void WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr) {
   num_pending_dispatches_ = 0;
 }
 
+void WebGpuContext::Flush() {
+  if (!current_command_encoder_) {
+    return;
+  }
+
+  EndComputePass();
+
+  auto command_buffer = current_command_encoder_.Finish();
+  device_queue_.Submit(1, &command_buffer);
+
+  current_command_encoder_ = nullptr;
+  num_pending_dispatches_ = 0;
+}
+
 void WebGpuContext::OnRunEnd() {
 #if defined(ENABLE_PIX_FOR_WEBGPU_EP)
   if (pix_frame_generator_) {

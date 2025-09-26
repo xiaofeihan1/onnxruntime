@@ -54,6 +54,10 @@ class ComputeContext {
   inline OpKernelContext& KernelContext() {
     return kernel_context_;
   }
+  // get webgpu_context_
+  WebGpuContext& WebGpuContext() {
+    return webgpu_context_;
+  }
 
   //
   // Get the logger.
@@ -144,7 +148,7 @@ class ComputeContext {
   Status PopErrorScope();
 
  protected:
-  WebGpuContext& webgpu_context_;
+  class WebGpuContext& webgpu_context_;
   OpKernelContext& kernel_context_;
   const WebGpuExecutionProvider& ep_;
 };

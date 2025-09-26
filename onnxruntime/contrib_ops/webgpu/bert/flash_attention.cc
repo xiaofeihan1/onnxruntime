@@ -7,6 +7,8 @@
 
 #include "core/providers/webgpu/webgpu_supported_types.h"
 
+#include <cstdio>  // for fprintf(stderr, ...)
+
 using namespace onnxruntime::webgpu;
 using namespace ::onnxruntime::common;
 using namespace ONNX_NAMESPACE;
@@ -558,6 +560,31 @@ Status ComputeFlashAttentionDecodeVxReduce(onnxruntime::webgpu::ComputeContext& 
   return context.RunProgram(program);
 }
 
+void Download(WebGpuContext& context_, WGPUBuffer src, void* dst, size_t size) {
+  //  EnforceBufferUnmapped(context_, src);
+  auto buffer_size = size;
+
+  wgpu::BufferDescriptor desc{};
+  desc.size = buffer_size;
+  desc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+
+  auto staging_buffer = context_.Device().CreateBuffer(&desc);
+  auto& command_encoder = context_.GetCommandEncoder();
+  context_.EndComputePass();
+  command_encoder.CopyBufferToBuffer(src, 0, staging_buffer, 0, buffer_size);
+  context_.Flush();
+
+  // TODO: revise wait in whole project
+
+  ORT_ENFORCE(context_.Wait(staging_buffer.MapAsync(wgpu::MapMode::Read, 0, buffer_size, wgpu::CallbackMode::WaitAnyOnly, [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+    ORT_ENFORCE(status == wgpu::MapAsyncStatus::Success, "Failed to download data from buffer: ", std::string_view{message});
+  })) == Status::OK());
+
+  auto mapped_data = staging_buffer.GetConstMappedRange();
+  memcpy(dst, mapped_data, size);
+  staging_buffer.Unmap();
+}
+
 Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
                            Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
                            const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context) {
@@ -611,6 +638,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   const TensorShapeVector metadata_dims({parameters.batch_size_, parameters.num_heads_,
                                          num_present_sequence_length_tile, 2});
   const TensorShape metadata_shape(metadata_dims);
+
   const TensorShapeVector out_split_vx_dims({parameters.batch_size_, parameters.num_heads_, num_present_sequence_length_tile, parameters.head_size_});
   const TensorShape out_split_vx_shape(out_split_vx_dims);
   Tensor out_split_vx = context.CreateGPUTensor(Q->DataType(), out_split_vx_shape);
@@ -620,6 +648,45 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
 
   //  ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeSplitVxScore(context, &metadata, &qk, &out_split_vx, present_value, parameters, num_total_seq_length_tile, num_present_sequence_length_tile, tile_size));
   ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeVxReduce(context, &out_split_vx, &metadata, output, parameters, num_total_seq_length_tile, num_present_sequence_length_tile));
+
+  // Download the output tensor (float16) from GPU and print min/max for debugging.
+  // NOTE: This debug block replaces the previous metadata dump.
+  if (output->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+    size_t byte_size = output->SizeInBytes();
+    void* output_raw = malloc(byte_size);
+    if (output_raw) {
+      Download(context.WebGpuContext(), reinterpret_cast<WGPUBuffer>(const_cast<void*>(output->DataRaw())), output_raw, byte_size);
+      const auto* data_f16 = reinterpret_cast<const onnxruntime::MLFloat16*>(output_raw);
+      size_t count = byte_size / sizeof(onnxruntime::MLFloat16);
+      float min_v = std::numeric_limits<float>::infinity();
+      float max_v = -std::numeric_limits<float>::infinity();
+      // 先统计最值
+      for (size_t i = 0; i < count; ++i) {
+        float v = data_f16[i].ToFloat();
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+      }
+      // 打印汇总信息（保持原有格式）
+      // fprintf(stderr, "FlashAttention output (fp16) count=%zu min=%f max=%f\n", count, min_v, max_v);
+      // 逐元素打印：同一行用逗号分隔，最后再换行，不打印索引
+      if (count > 0) {
+        for (size_t i = 0; i < count; ++i) {
+          float v = data_f16[i].ToFloat();
+          if (i == 0) {
+            fprintf(stderr, "%g", v);
+          } else {
+            fprintf(stderr, ",%g", v);
+          }
+        }
+        fprintf(stderr, "\n");
+      }
+      free(output_raw);
+    } else {
+      fprintf(stderr, "FlashAttention output debug: malloc failed for %zu bytes\n", byte_size);
+    }
+  } else {
+    fprintf(stderr, "FlashAttention output tensor is not float16, debug skip.\n");
+  }
 
   return Status::OK();
 }
