@@ -106,33 +106,41 @@ Status RunSplitPackedQKVWithRotaryEmbedding(onnxruntime::webgpu::ComputeContext&
   const auto half_rotary_embedding_dim = gsl::narrow_cast<uint32_t>(cos_cache->Shape()[1]);
   const auto head_size = params.head_size_;
 
+  // Calculate components for vectorization (only for non-interleaved mode)
+  const int components = (!params.rotary_interleaved_ && (params.head_size_ % 4 == 0)) ? 4 : (!params.rotary_interleaved_ && (params.head_size_ % 2 == 0)) ? 2
+                                                                                                                                                           : 1;
+
+  // Adjust dimensions for vectorization
+  const auto half_rotary_embedding_dim_vec = half_rotary_embedding_dim / components;
+  const auto head_size_vec = head_size / components;
+
   // Dispatch: batch_size * sequence_length * num_heads * (half_rotary_dim + need_copy_dim)
   // work_per_head = half_rotary_dim + (head_size - 2 * half_rotary_dim)
   //               = head_size - half_rotary_dim
-  const auto work_per_head = head_size - half_rotary_embedding_dim;
-  auto dispatch_size = static_cast<uint32_t>(params.batch_size_ * params.sequence_length_ * params.num_heads_ * work_per_head);
+  const auto work_per_head_vec = head_size_vec - half_rotary_embedding_dim_vec;
+  auto dispatch_size = static_cast<uint32_t>(params.batch_size_ * params.sequence_length_ * params.num_heads_ * work_per_head_vec);
 
   SplitPackedQKVWithRotaryEmbeddingProgram program(params.rotary_interleaved_);
   program
-      .CacheHint(params.rotary_interleaved_)
-      .AddInput({packedQKV, ProgramTensorMetadataDependency::Rank})
+      .CacheHint(params.rotary_interleaved_, components)
+      .AddInput({packedQKV, ProgramTensorMetadataDependency::Rank, components})
       .AddInputs({
           {seqlen_k, ProgramTensorMetadataDependency::Rank},
           {cos_cache, ProgramTensorMetadataDependency::Rank},
           {sin_cache, ProgramTensorMetadataDependency::Rank},
       })
-      .AddOutputs({{query, ProgramTensorMetadataDependency::Rank},
-                   {key, ProgramTensorMetadataDependency::Rank},
-                   {val, ProgramTensorMetadataDependency::Rank}})
+      .AddOutputs({{query, ProgramTensorMetadataDependency::Rank, components},
+                   {key, ProgramTensorMetadataDependency::Rank, components},
+                   {val, ProgramTensorMetadataDependency::Rank, components}})
       .AddUniformVariables({
           {static_cast<uint32_t>(params.batch_size_)},
           {static_cast<uint32_t>(params.sequence_length_)},
-          {static_cast<uint32_t>(params.hidden_size_)},
-          {static_cast<uint32_t>(params.kv_hidden_size_)},
+          {static_cast<uint32_t>(params.hidden_size_ / components)},
+          {static_cast<uint32_t>(params.kv_hidden_size_ / components)},
           {static_cast<uint32_t>(params.num_heads_)},
           {static_cast<uint32_t>(params.kv_num_heads_)},
-          {static_cast<uint32_t>(head_size)},
-          {half_rotary_embedding_dim},
+          {head_size_vec},
+          {half_rotary_embedding_dim_vec},
           {static_cast<uint32_t>(params.is_first_prompt_ ? 1 : 0)},
           {static_cast<uint32_t>(params.is_subsequent_prompt_ ? 1 : 0)},
       })
@@ -283,7 +291,7 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
 
   Tensor qRotary;
   Tensor kRotary;
-  if (parameters.is_packed_qkv_ && do_rotary_) {
+  if (parameters.is_packed_qkv_ && do_rotary_ && !parameters.rotary_interleaved_) {
     qSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.hidden_size_}));
     kSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.kv_hidden_size_}));
     vSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.kv_hidden_size_}));

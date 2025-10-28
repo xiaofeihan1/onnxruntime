@@ -107,7 +107,7 @@ Status ProgramManager::Build(const ProgramBase& program,
   wgpu::ShaderModuleDescriptor descriptor{};
   descriptor.nextInChain = &wgsl_source;
 
-  auto shader_module = device_.CreateShaderModule(&descriptor);
+  auto sh、ader_module = device_.CreateShaderModule(&descriptor);
 
   // TODO: a new cache hierarchy for constants.
   //
