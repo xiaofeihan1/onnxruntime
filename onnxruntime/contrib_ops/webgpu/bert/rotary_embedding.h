@@ -44,7 +44,8 @@ class FusedQKRotaryEmbeddingProgram final : public Program<FusedQKRotaryEmbeddin
       {"q_input_output_stride", ProgramUniformVariableDataType::Uint32},
       {"k_global_shape", ProgramUniformVariableDataType::Uint32},
       {"k_input_output_stride", ProgramUniformVariableDataType::Uint32},
-      {"q_domain_size", ProgramUniformVariableDataType::Uint32});
+      {"q_domain_size", ProgramUniformVariableDataType::Uint32},
+      {"half_rotary_dim_vec", ProgramUniformVariableDataType::Uint32});
 
  private:
   const bool interleaved_;
@@ -71,7 +72,6 @@ class SplitPackedQKVWithRotaryEmbeddingProgram final : public Program<SplitPacke
  private:
   const bool interleaved_;
 };
-
 
 class RotaryEmbedding final : public WebGpuKernel {
  public:
