@@ -32,56 +32,64 @@ ONNX_OPERATOR_KERNEL_EX(
     GroupQueryAttention);
 
 Status SplitPackedQKVProgram::GenerateShaderCode(ShaderHelper& sh) const {
-  const auto& packed_qkv = sh.AddInput("packed_qkv", ShaderUsage::UseUniform);
-  const auto& query = sh.AddOutput("query", ShaderUsage::UseUniform);
-  const auto& key = sh.AddOutput("key", ShaderUsage::UseUniform);
-  const auto& value = sh.AddOutput("val", ShaderUsage::UseUniform);
+  const auto& packed_qkv = sh.AddInput("packed_qkv", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  const auto& query = sh.AddOutput("query", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  const auto& key = sh.AddOutput("key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  const auto& value = sh.AddOutput("val", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
 
   sh.MainFunctionBody() << sh.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.q_size")
-                        << "  // Dispatch over Q domain only\n"
-                        << "  let q_flat_idx = global_idx;\n"
-                        << "  let batch_idx = q_flat_idx / (uniforms.sequence_length * uniforms.hidden_size);\n"
-                        << "  let remainder = q_flat_idx % (uniforms.sequence_length * uniforms.hidden_size);\n"
+                        << "  // Dispatch over Q domain only (vectorized)\n"
+                        << "  let q_vec_idx = global_idx;\n"
+                        << "  let batch_idx = q_vec_idx / (uniforms.sequence_length * uniforms.hidden_size);\n"
+                        << "  let remainder = q_vec_idx % (uniforms.sequence_length * uniforms.hidden_size);\n"
                         << "  let seq_idx = remainder / uniforms.hidden_size;\n"
-                        << "  let hidden_idx = remainder % uniforms.hidden_size;\n"
+                        << "  let hidden_vec_idx = remainder % uniforms.hidden_size;\n"
                         << "\n"
-                        << "  // Calculate base offset for this (batch, seq) position in packed_qkv\n"
+                        << "  // Calculate base offset for this (batch, seq) position in packed_qkv (in vector units)\n"
                         << "  // Layout per token: [Q(hidden_size), K(kv_hidden_size), V(kv_hidden_size)]\n"
                         << "  let token_size = uniforms.hidden_size + 2u * uniforms.kv_hidden_size;\n"
                         << "  let base_offset = batch_idx * uniforms.sequence_length * token_size + seq_idx * token_size;\n"
                         << "\n"
-                        << "  // Read and write Q\n"
-                        << "  let q_offset = base_offset + hidden_idx;\n"
-                        << "  let q_data = " << packed_qkv.GetByOffset("q_offset") << ";\n"
-                        << "  " << query.SetByIndices("vec3<u32>(batch_idx, seq_idx, hidden_idx)", "q_data") << ";\n"
+                        << "  // Read and write Q (vectorized)\n"
+                        << "  let q_offset = base_offset + hidden_vec_idx;\n"
+                        << "  let q_data = packed_qkv[q_offset];\n"
+                        << "  query[q_vec_idx] = q_data;\n"
                         << "\n"
                         << "  // Process K and V if within kv_hidden_size range\n"
-                        << "  if (hidden_idx < uniforms.kv_hidden_size) {\n"
-                        << "    let k_offset = base_offset + uniforms.hidden_size + hidden_idx;\n"
-                        << "    let k_data = " << packed_qkv.GetByOffset("k_offset") << ";\n"
-                        << "    " << key.SetByIndices("vec3<u32>(batch_idx, seq_idx, hidden_idx)", "k_data") << ";\n"
+                        << "  if (hidden_vec_idx < uniforms.kv_hidden_size) {\n"
+                        << "    let kv_vec_idx = batch_idx * uniforms.sequence_length * uniforms.kv_hidden_size + seq_idx * uniforms.kv_hidden_size + hidden_vec_idx;\n"
+                        << "    let k_offset = base_offset + uniforms.hidden_size + hidden_vec_idx;\n"
+                        << "    let k_data = packed_qkv[k_offset];\n"
+                        << "    key[kv_vec_idx] = k_data;\n"
                         << "\n"
-                        << "    let v_offset = base_offset + uniforms.hidden_size + uniforms.kv_hidden_size + hidden_idx;\n"
-                        << "    let v_data = " << packed_qkv.GetByOffset("v_offset") << ";\n"
-                        << "    " << value.SetByIndices("vec3<u32>(batch_idx, seq_idx, hidden_idx)", "v_data") << ";\n"
+                        << "    let v_offset = base_offset + uniforms.hidden_size + uniforms.kv_hidden_size + hidden_vec_idx;\n"
+                        << "    let v_data = packed_qkv[v_offset];\n"
+                        << "    val[kv_vec_idx] = v_data;\n"
                         << "  }\n";
   return Status::OK();
 }
 
 Status SplitPackedQKV(onnxruntime::webgpu::ComputeContext& context, const WebgpuAttentionParameters& params, const Tensor* packedQKV, Tensor* query, Tensor* key, Tensor* val) {
   SplitPackedQKVProgram program;
-  // Dispatch only over Q domain: batch_size * sequence_length * hidden_size
+  // Dispatch only over Q domain with vectorization optimization: batch_size * sequence_length * hidden_size
   auto q_size = static_cast<uint32_t>(params.batch_size_ * params.sequence_length_ * params.hidden_size_);
+  // auto kv_size = static_cast<uint32_t>(params.batch_size_ * params.sequence_length_ * params.kv_hidden_size_);
+  // auto packed_size = static_cast<uint32_t>(packedQKV->Shape().Size());
+
+  const int components = params.head_size_ % 4 == 0 ? 4 : (params.head_size_ % 2 == 0 ? 2 : 1);
+
   program
-      .AddInput({packedQKV, ProgramTensorMetadataDependency::Rank})
-      .AddOutputs({{query, ProgramTensorMetadataDependency::Rank}, {key, ProgramTensorMetadataDependency::Rank}, {val, ProgramTensorMetadataDependency::Rank}})
+      .AddInput({packedQKV, ProgramTensorMetadataDependency::Rank, components})
+      .AddOutputs({{query, ProgramTensorMetadataDependency::Rank, components},
+                   {key, ProgramTensorMetadataDependency::Rank, components},
+                   {val, ProgramTensorMetadataDependency::Rank, components}})
       .AddUniformVariables({
-          {static_cast<uint32_t>(q_size)},
+          {static_cast<uint32_t>(q_size / components)},
           {static_cast<uint32_t>(params.sequence_length_)},
-          {static_cast<uint32_t>(params.hidden_size_)},
-          {static_cast<uint32_t>(params.kv_hidden_size_)},
+          {static_cast<uint32_t>(params.hidden_size_ / components)},
+          {static_cast<uint32_t>(params.kv_hidden_size_ / components)},
       })
-      .SetDispatchGroupSize((q_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE);
+      .SetDispatchGroupSize((q_size / components + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE);
   return context.RunProgram(program);
 }
 
