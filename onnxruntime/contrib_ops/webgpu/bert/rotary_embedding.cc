@@ -52,22 +52,23 @@ Status RotaryEmbeddingProgram::GenerateShaderCode(ShaderHelper& shader) const {
 
 Status FusedQKRotaryEmbeddingProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Inputs
-  const auto& q_input = shader.AddInput("q_input", ShaderUsage::UseUniform);
-  const auto& k_input = shader.AddInput("k_input", ShaderUsage::UseUniform);
+  const auto& q_input = shader.AddInput("q_input", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  const auto& k_input = shader.AddInput("k_input", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
   const auto& seqlens = shader.AddInput("seqlens", ShaderUsage::UseUniform);
   const auto& cos_cache = shader.AddInput("cos_cache", ShaderUsage::UseUniform);
   const auto& sin_cache = shader.AddInput("sin_cache", ShaderUsage::UseUniform);
   // Outputs
-  const auto& q_output = shader.AddOutput("q_output", ShaderUsage::UseUniform);
-  const auto& k_output = shader.AddOutput("k_output", ShaderUsage::UseUniform);
+  const auto& q_output = shader.AddOutput("q_output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  const auto& k_output = shader.AddOutput("k_output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
 
   const auto interleaved_str = interleaved_ ? "true" : "false";
 
   shader.MainFunctionBody()
       << "  if (global_idx >= uniforms.q_domain_size) { return; }\n"
-      << "  let half_rotary_dim = uniforms.cos_cache_shape[1];\n"
       << "  let bsnh = global_idx / uniforms.q_global_stride % uniforms.q_global_shape;\n"
-      << "  if (bsnh[3] < half_rotary_dim) {\n"
+      << "  // Note: bsnh[3] is vectorized index, compare with vectorized half_rotary_dim from uniforms\n"
+      << "  let half_rotary_dim_vec = uniforms.half_rotary_dim_vec;\n"
+      << "  if (bsnh[3] < half_rotary_dim_vec) {\n"
       << "    let batch_idx = bsnh[0];\n"
       << "    let sequence_idx = bsnh[1];\n"
       << "    let seqlen_i = " << seqlens.GetByOffset("batch_idx") << ";\n"
@@ -75,30 +76,58 @@ Status FusedQKRotaryEmbeddingProgram::GenerateShaderCode(ShaderHelper& shader) c
       << "    let total_seqlen = seqlen + 1u;\n"
       << "    let past_seqlen = total_seqlen - uniforms.q_global_shape[1];\n"
       << "    let position_id = past_seqlen + sequence_idx;\n"
-      << "    let cos_v = " << cos_cache.GetByIndices("vec2<u32>(position_id, bsnh[3])") << ";\n"
-      << "    let sin_v = " << sin_cache.GetByIndices("vec2<u32>(position_id, bsnh[3])") << ";\n"
-      << "    let qi = dot(bsnh, uniforms.q_input_output_stride) + select(0u, bsnh[3], " << interleaved_str << ");\n"
-      << "    let qj = qi + select(half_rotary_dim, 1u, " << interleaved_str << ");\n"
-      << "    let q_re = " << q_input.GetByOffset("qi") << " * cos_v - " << q_input.GetByOffset("qj") << " * sin_v;\n"
-      << "    " << q_output.SetByOffset("qi", "q_re") << "\n"
-      << "    let q_im = " << q_input.GetByOffset("qi") << " * sin_v + " << q_input.GetByOffset("qj") << " * cos_v;\n"
-      << "    " << q_output.SetByOffset("qj", "q_im") << "\n"
+      << "    \n"
+      << "    // Calculate offsets for vectorized access (non-interleaved mode)\n"
+      << "    let qi_vec = dot(bsnh, uniforms.q_input_output_stride) + select(0u, bsnh[3], " << interleaved_str << ");\n"
+      << "    let qj_vec = qi_vec + select(half_rotary_dim_vec, 1u, " << interleaved_str << ");\n"
+      << "    \n"
+      << "    // Read vectorized Q values\n"
+      << "    let q_i_vec = " << q_input.GetByOffset("qi_vec") << ";\n"
+      << "    let q_j_vec = " << q_input.GetByOffset("qj_vec") << ";\n"
+      << "    \n"
+      << "    // Apply rotary embedding component-wise\n"
+      << "    var q_re_vec: q_input_value_t;\n"
+      << "    var q_im_vec: q_input_value_t;\n"
+      << "    for (var comp: u32 = 0u; comp < " << q_input.NumComponents() << "u; comp++) {\n"
+      << "      // bsnh[3] is vectorized, need to convert to scalar index for cos/sin lookup\n"
+      << "      let scalar_idx = bsnh[3] * " << q_input.NumComponents() << "u + comp;\n"
+      << "      let cos_v = " << cos_cache.GetByIndices("vec2<u32>(position_id, scalar_idx)") << ";\n"
+      << "      let sin_v = " << sin_cache.GetByIndices("vec2<u32>(position_id, scalar_idx)") << ";\n"
+      << "      q_re_vec[comp] = q_i_vec[comp] * cos_v - q_j_vec[comp] * sin_v;\n"
+      << "      q_im_vec[comp] = q_i_vec[comp] * sin_v + q_j_vec[comp] * cos_v;\n"
+      << "    }\n"
+      << "    \n"
+      << "    " << q_output.SetByOffset("qi_vec", "q_re_vec") << "\n"
+      << "    " << q_output.SetByOffset("qj_vec", "q_im_vec") << "\n"
+      << "    \n"
       // Conditionally process Key (only for heads that exist in K domain)
       << "    if (bsnh[2] < uniforms.k_global_shape[2]) {\n"
-      << "      let ki = dot(bsnh, uniforms.k_input_output_stride) + select(0u, bsnh[3], " << interleaved_str << ");\n"
-      << "      let kj = ki + select(half_rotary_dim, 1u, " << interleaved_str << ");\n"
-      << "      let k_re = " << k_input.GetByOffset("ki") << " * cos_v - " << k_input.GetByOffset("kj") << " * sin_v;\n"
-      << "      " << k_output.SetByOffset("ki", "k_re") << "\n"
-      << "      let k_im = " << k_input.GetByOffset("ki") << " * sin_v + " << k_input.GetByOffset("kj") << " * cos_v;\n"
-      << "      " << k_output.SetByOffset("kj", "k_im") << "\n"
+      << "      let ki_vec = dot(bsnh, uniforms.k_input_output_stride) + select(0u, bsnh[3], " << interleaved_str << ");\n"
+      << "      let kj_vec = ki_vec + select(half_rotary_dim_vec, 1u, " << interleaved_str << ");\n"
+      << "      \n"
+      << "      let k_i_vec = " << k_input.GetByOffset("ki_vec") << ";\n"
+      << "      let k_j_vec = " << k_input.GetByOffset("kj_vec") << ";\n"
+      << "      \n"
+      << "      var k_re_vec: k_input_value_t;\n"
+      << "      var k_im_vec: k_input_value_t;\n"
+      << "      for (var comp: u32 = 0u; comp < " << k_input.NumComponents() << "u; comp++) {\n"
+      << "        let scalar_idx = bsnh[3] * " << k_input.NumComponents() << "u + comp;\n"
+      << "        let cos_v = " << cos_cache.GetByIndices("vec2<u32>(position_id, scalar_idx)") << ";\n"
+      << "        let sin_v = " << sin_cache.GetByIndices("vec2<u32>(position_id, scalar_idx)") << ";\n"
+      << "        k_re_vec[comp] = k_i_vec[comp] * cos_v - k_j_vec[comp] * sin_v;\n"
+      << "        k_im_vec[comp] = k_i_vec[comp] * sin_v + k_j_vec[comp] * cos_v;\n"
+      << "      }\n"
+      << "      \n"
+      << "      " << k_output.SetByOffset("ki_vec", "k_re_vec") << "\n"
+      << "      " << k_output.SetByOffset("kj_vec", "k_im_vec") << "\n"
       << "    }\n"
       << "  } else {\n"
-      << "    let qk = dot(bsnh, uniforms.q_input_output_stride) + half_rotary_dim;\n"
-      << "    " << q_output.SetByOffset("qk", q_input.GetByOffset("qk")) << "\n"
+      << "    let qk_vec = dot(bsnh, uniforms.q_input_output_stride) + half_rotary_dim_vec;\n"
+      << "    " << q_output.SetByOffset("qk_vec", q_input.GetByOffset("qk_vec")) << "\n"
       // Conditionally process Key (only for heads that exist in K domain)
       << "    if (bsnh[2] < uniforms.k_global_shape[2]) {\n"
-      << "      let kk = dot(bsnh, uniforms.k_input_output_stride) + half_rotary_dim;\n"
-      << "      " << k_output.SetByOffset("kk", k_input.GetByOffset("kk")) << "\n"
+      << "      let kk_vec = dot(bsnh, uniforms.k_input_output_stride) + half_rotary_dim_vec;\n"
+      << "      " << k_output.SetByOffset("kk_vec", k_input.GetByOffset("kk_vec")) << "\n"
       << "    }\n"
       << "  }\n";
   return Status::OK();

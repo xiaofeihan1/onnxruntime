@@ -32,10 +32,10 @@ ONNX_OPERATOR_KERNEL_EX(
     GroupQueryAttention);
 
 Status SplitPackedQKVProgram::GenerateShaderCode(ShaderHelper& sh) const {
-  const auto& packed_qkv = sh.AddInput("packed_qkv", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
-  const auto& query = sh.AddOutput("query", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
-  const auto& key = sh.AddOutput("key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
-  const auto& value = sh.AddOutput("val", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  sh.AddInput("packed_qkv", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  sh.AddOutput("query", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  sh.AddOutput("key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  sh.AddOutput("val", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
 
   sh.MainFunctionBody() << sh.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.q_size")
                         << "  // Dispatch over Q domain only (vectorized)\n"
@@ -161,11 +161,19 @@ Status RunFusedQKRotaryEmbedding(onnxruntime::webgpu::ComputeContext& context,
   const auto half_rotary_embedding_dim = gsl::narrow_cast<uint32_t>(cos_cache->Shape()[1]);
   const auto head_size = params.head_size_;
 
+  // Calculate components for vectorization (only for non-interleaved mode)
+  const int components = (!params.rotary_interleaved_ && (params.head_size_ % 4 == 0)) ? 4 : (!params.rotary_interleaved_ && (params.head_size_ % 2 == 0)) ? 2
+                                                                                                                                                           : 1;
+
+  // Adjust dimensions for vectorization
+  const auto half_rotary_embedding_dim_vec = half_rotary_embedding_dim / components;
+  const auto head_size_vec = head_size / components;
+
   // Build Q domain
   const auto hidden_size_q = params.hidden_size_;
   const TensorShape q_global_shape({params.batch_size_, params.sequence_length_,
                                     hidden_size_q / head_size,
-                                    static_cast<int64_t>(head_size - half_rotary_embedding_dim)});
+                                    static_cast<int64_t>(head_size_vec - half_rotary_embedding_dim_vec)});
   const auto rank = q_global_shape.NumDimensions();
   std::vector<uint32_t> q_global_dims(rank);
   std::vector<uint32_t> q_global_strides(rank);
@@ -178,7 +186,7 @@ Status RunFusedQKRotaryEmbedding(onnxruntime::webgpu::ComputeContext& context,
   const auto hidden_size_k = params.kv_hidden_size_;
   const TensorShape k_global_shape({params.batch_size_, params.sequence_length_,
                                     hidden_size_k / head_size,
-                                    static_cast<int64_t>(head_size - half_rotary_embedding_dim)});
+                                    static_cast<int64_t>(head_size_vec - half_rotary_embedding_dim_vec)});
   std::vector<uint32_t> k_global_dims(rank);
   for (size_t j = 0; j < rank; ++j) {
     k_global_dims[j] = gsl::narrow_cast<uint32_t>(k_global_shape[j]);
@@ -188,30 +196,30 @@ Status RunFusedQKRotaryEmbedding(onnxruntime::webgpu::ComputeContext& context,
 
   const auto q_input_output_strides = std::vector<uint32_t>(
       {gsl::narrow_cast<uint32_t>(query_in->Shape().SizeFromDimension(1)),
-       gsl::narrow_cast<uint32_t>(hidden_size_q),
-       gsl::narrow_cast<uint32_t>(head_size),
+       gsl::narrow_cast<uint32_t>(hidden_size_q / components),
+       gsl::narrow_cast<uint32_t>(head_size_vec),
        1u});
 
   const auto k_input_output_strides = std::vector<uint32_t>(
       {gsl::narrow_cast<uint32_t>(key_in->Shape().SizeFromDimension(1)),
-       gsl::narrow_cast<uint32_t>(hidden_size_k),
-       gsl::narrow_cast<uint32_t>(head_size),
+       gsl::narrow_cast<uint32_t>(hidden_size_k / components),
+       gsl::narrow_cast<uint32_t>(head_size_vec),
        1u});
 
   // Dispatch computations only over the Q domain, and fuse K write operations using a head-index-based condition.
   FusedQKRotaryEmbeddingProgram program(params.rotary_interleaved_);
   program
-      .CacheHint(params.rotary_interleaved_)
+      .CacheHint(params.rotary_interleaved_, components)
       .AddInputs({
-          {query_in, ProgramTensorMetadataDependency::Rank},
-          {key_in, ProgramTensorMetadataDependency::Rank},
+          {query_in, ProgramTensorMetadataDependency::Rank, components},
+          {key_in, ProgramTensorMetadataDependency::Rank, components},
           {seqlen_k, ProgramTensorMetadataDependency::Rank},
           {cos_cache, ProgramTensorMetadataDependency::Rank},
           {sin_cache, ProgramTensorMetadataDependency::Rank},
       })
       .AddOutputs({
-          {query_out, ProgramTensorMetadataDependency::Rank},
-          {key_out, ProgramTensorMetadataDependency::Rank},
+          {query_out, ProgramTensorMetadataDependency::Rank, components},
+          {key_out, ProgramTensorMetadataDependency::Rank, components},
       })
       .SetDispatchGroupSize((q_domain_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
       .AddUniformVariables({
@@ -222,6 +230,7 @@ Status RunFusedQKRotaryEmbedding(onnxruntime::webgpu::ComputeContext& context,
           {gsl::make_span(k_global_dims)},
           {gsl::make_span(k_input_output_strides)},
           {q_domain_size},
+          {half_rotary_embedding_dim_vec},  // Add vectorized half_rotary_dim
       });
 
   return context.RunProgram(program);
@@ -291,7 +300,7 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
 
   Tensor qRotary;
   Tensor kRotary;
-  if (parameters.is_packed_qkv_ && do_rotary_ && !parameters.rotary_interleaved_) {
+  if (parameters.is_packed_qkv_ && do_rotary_ && parameters.rotary_interleaved_) {
     qSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.hidden_size_}));
     kSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.kv_hidden_size_}));
     vSplit = context.CreateGPUTensor(query->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.kv_hidden_size_}));
